@@ -12,3 +12,5 @@ training_logs/
 experiments/
 state_experiments/
 .matplotlib/
+flappy_bird2_colab.zip
+flappy_bird2_colab/

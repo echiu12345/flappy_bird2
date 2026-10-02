@@ -94,8 +94,12 @@ difference is the DQN versus Double DQN bootstrap target.
 Generate the comparison graph with the same plotting tool:
 
 ```powershell
-.\.venv\Scripts\python.exe plot_comparison.py --dqn state_experiments/state-dqn-seed42/episodes.csv --ddqn state_experiments/state-ddqn-seed42/episodes.csv --output state_experiments/dqn-vs-ddqn.png
+.\.venv\Scripts\python.exe plot_comparison.py --dqn state_experiments/state-dqn-seed42/episodes.csv --ddqn state_experiments/state-ddqn-seed42/episodes.csv --max-timestep 500000 --output state_experiments/dqn-vs-ddqn.png
 ```
+
+`--max-timestep 500000` applies the same interaction budget to both logs even
+when one run continued training beyond 500,000 steps. The score panel marks the
+highest rolling mean in the selected range.
 
 Evaluate saved policies without exploration or learning, using a different
 seed from training:
