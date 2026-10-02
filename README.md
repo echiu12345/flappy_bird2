@@ -20,6 +20,58 @@ cd DeepLearningFlappyBird
 python deep_q_network.py
 ```
 
+### Target network and Double DQN
+
+This version uses a separate target network to stabilize training and Double
+DQN targets to reduce Q-value overestimation. The online network selects the
+best next action, and the target network evaluates that action. The target
+network is synchronized every 1,000 frames.
+
+The original pretrained DQN in `saved_networks` remains compatible. On the
+first run its online-network weights are loaded and copied to the target
+network. New checkpoints are written to `saved_networks_double_dqn`, leaving
+the original pretrained files unchanged.
+
+### Compare DQN and Double DQN
+
+For a fair comparison, both modes use the same target network, architecture,
+hyperparameters, random seed, and training schedule. They differ only in the
+bootstrap target. Start two independent runs from random weights:
+
+```powershell
+.\.venv\Scripts\python.exe deep_q_network.py --algorithm dqn --run-name dqn-seed42 --from-scratch --seed 42 --fps 0 --max-steps 500000
+.\.venv\Scripts\python.exe deep_q_network.py --algorithm ddqn --run-name ddqn-seed42 --from-scratch --seed 42 --fps 0 --max-steps 500000
+```
+
+Fresh runs start with epsilon 0.1, as recommended in the reproduction section
+below. `--fps 0` removes the 30 FPS delay during training. Omit it if you want
+to watch the game at normal speed. Run the experiments separately so they do
+not compete for CPU resources. Both commands use the same 500,000-step budget.
+For a stronger result, repeat the comparison with several seed values.
+
+Each run records one row per completed episode in
+`experiments/<run-name>/episodes.csv`. The main comparison metric is episode
+score versus environment timestep. Episode reward, duration, mean predicted
+maximum Q, and mean training loss are also recorded for diagnosis.
+
+You can graph one run while it is still training because the CSV is flushed
+after every episode:
+
+```powershell
+.\.venv\Scripts\python.exe plot_comparison.py --dqn experiments/dqn-seed42/episodes.csv --output experiments/dqn-seed42/progress.png
+```
+
+After both runs contain results, create the comparison graph:
+
+```powershell
+.\.venv\Scripts\python.exe plot_comparison.py --dqn experiments/dqn-seed42/episodes.csv --ddqn experiments/ddqn-seed42/episodes.csv --output experiments/dqn-vs-ddqn.png
+```
+
+The solid lines are rolling means over 100 episodes; faint lines are raw
+episode measurements. A higher score curve indicates better game performance.
+A much higher DQN Q-value curve without a corresponding score improvement is
+evidence consistent with Q-value overestimation, but is not proof by itself.
+
 ## What is Deep Q-Network?
 It is a convolutional neural network, trained with a variant of Q-learning, whose input is raw pixels and whose output is a value function estimating future rewards.
 

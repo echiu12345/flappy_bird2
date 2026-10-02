@@ -3,4 +3,11 @@
 
 # Local Python virtual environment.
 .venv/
+.vscode
 
+# Generated Double DQN checkpoints can be large.
+saved_networks_double_dqn/
+saved_networks_dqn/
+training_logs/
+experiments/
+.matplotlib/
