@@ -57,7 +57,35 @@ class GameState:
         self.playerFlapAcc =  -9   # players speed on flapping
         self.playerFlapped = False # True when player flaps
 
-    def frame_step(self, input_actions):
+    def get_state(self):
+        """Return a compact Markov-style state for non-visual RL agents."""
+        player_mid_x = self.playerx + PLAYER_WIDTH / 2.0
+        player_mid_y = self.playery + PLAYER_HEIGHT / 2.0
+
+        next_pipe_index = 0
+        for index, pipe in enumerate(self.upperPipes):
+            pipe_mid_x = pipe['x'] + PIPE_WIDTH / 2.0
+            if pipe_mid_x >= player_mid_x:
+                next_pipe_index = index
+                break
+        else:
+            next_pipe_index = len(self.upperPipes) - 1
+
+        upper_pipe = self.upperPipes[next_pipe_index]
+        lower_pipe = self.lowerPipes[next_pipe_index]
+        pipe_mid_x = upper_pipe['x'] + PIPE_WIDTH / 2.0
+        gap_top = upper_pipe['y'] + PIPE_HEIGHT
+        gap_bottom = lower_pipe['y']
+        gap_mid_y = (gap_top + gap_bottom) / 2.0
+
+        return np.asarray([
+            player_mid_y / SCREENHEIGHT,
+            self.playerVelY / float(self.playerMaxVelY),
+            (pipe_mid_x - player_mid_x) / SCREENWIDTH,
+            (player_mid_y - gap_mid_y) / SCREENHEIGHT,
+        ], dtype=np.float32)
+
+    def frame_step(self, input_actions, return_image=True):
         pygame.event.pump()
 
         reward = 0.1
@@ -125,21 +153,23 @@ class GameState:
             self.__init__()
             reward = -1
 
-        # draw sprites
-        SCREEN.blit(IMAGES['background'], (0,0))
+        image_data = None
+        if return_image:
+            # draw sprites
+            SCREEN.blit(IMAGES['background'], (0,0))
 
-        for uPipe, lPipe in zip(self.upperPipes, self.lowerPipes):
-            SCREEN.blit(IMAGES['pipe'][0], (uPipe['x'], uPipe['y']))
-            SCREEN.blit(IMAGES['pipe'][1], (lPipe['x'], lPipe['y']))
+            for uPipe, lPipe in zip(self.upperPipes, self.lowerPipes):
+                SCREEN.blit(IMAGES['pipe'][0], (uPipe['x'], uPipe['y']))
+                SCREEN.blit(IMAGES['pipe'][1], (lPipe['x'], lPipe['y']))
 
-        SCREEN.blit(IMAGES['base'], (self.basex, BASEY))
-        # print score so player overlaps the score
-        # showScore(self.score)
-        SCREEN.blit(IMAGES['player'][self.playerIndex],
-                    (self.playerx, self.playery))
+            SCREEN.blit(IMAGES['base'], (self.basex, BASEY))
+            # print score so player overlaps the score
+            # showScore(self.score)
+            SCREEN.blit(IMAGES['player'][self.playerIndex],
+                        (self.playerx, self.playery))
 
-        image_data = pygame.surfarray.array3d(pygame.display.get_surface())
-        pygame.display.update()
+            image_data = pygame.surfarray.array3d(pygame.display.get_surface())
+            pygame.display.update()
         FPSCLOCK.tick(FPS)
         #print self.upperPipes[0]['y'] + PIPE_HEIGHT - int(BASEY * 0.2)
         return image_data, reward, terminal

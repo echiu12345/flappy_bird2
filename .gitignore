@@ -10,4 +10,5 @@ saved_networks_double_dqn/
 saved_networks_dqn/
 training_logs/
 experiments/
+state_experiments/
 .matplotlib/

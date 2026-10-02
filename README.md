@@ -72,6 +72,58 @@ episode measurements. A higher score curve indicates better game performance.
 A much higher DQN Q-value curve without a corresponding score improvement is
 evidence consistent with Q-value overestimation, but is not proof by itself.
 
+### Four-feature state experiments
+
+`state_q_network.py` provides a faster experiment that uses four normalized
+numeric features instead of pixels:
+
+1. Bird vertical position.
+2. Bird vertical velocity.
+3. Horizontal distance to the next pipe.
+4. Signed vertical distance from the bird to the pipe-gap center.
+
+Both algorithms use the same `4 -> 256 -> 256 -> 2` MLP, replay memory, Huber
+loss, exploration schedule, and soft target updates. The only algorithmic
+difference is the DQN versus Double DQN bootstrap target.
+
+```powershell
+.\.venv\Scripts\python.exe state_q_network.py --algorithm dqn --run-name state-dqn-seed42 --from-scratch --seed 42
+.\.venv\Scripts\python.exe state_q_network.py --algorithm ddqn --run-name state-ddqn-seed42 --from-scratch --seed 42
+```
+
+Generate the comparison graph with the same plotting tool:
+
+```powershell
+.\.venv\Scripts\python.exe plot_comparison.py --dqn state_experiments/state-dqn-seed42/episodes.csv --ddqn state_experiments/state-ddqn-seed42/episodes.csv --output state_experiments/dqn-vs-ddqn.png
+```
+
+Evaluate saved policies without exploration or learning, using a different
+seed from training:
+
+```powershell
+.\.venv\Scripts\python.exe state_q_network.py --mode eval --algorithm dqn --run-name state-dqn-seed42 --seed 1042 --eval-episodes 100
+.\.venv\Scripts\python.exe state_q_network.py --mode eval --algorithm ddqn --run-name state-ddqn-seed42 --seed 1042 --eval-episodes 100
+```
+
+#### Run state DDQN on Google Colab
+
+Open `colab_ddqn.ipynb` in Google Colab and select a GPU runtime. The notebook
+clones this repository, verifies that TensorFlow detects the GPU, and stores
+the `state_experiments` directory in Google Drive. Re-running the training cell
+resumes the saved run instead of starting again. The notebook uses no rendering
+because Colab runs the Pygame environment headlessly.
+
+The four-feature MLP is small, so a GPU may provide only a modest speedup. Game
+simulation, Python control flow, and replay-memory sampling still run on the
+CPU. Compare wall-clock timesteps per second before concluding that the GPU is
+faster.
+
+The MLP, soft target update, Huber loss, and episode-level training design were
+informed by the MIT-licensed
+[Flappy Bird Reinforcement Learning](https://github.com/ritiktyagiai/Flappy-Bird-Reinforcement-Learning)
+project. This implementation keeps this repository's existing game physics and
+reward function so DQN and Double DQN remain directly comparable.
+
 ## What is Deep Q-Network?
 It is a convolutional neural network, trained with a variant of Q-learning, whose input is raw pixels and whose output is a value function estimating future rewards.
 
