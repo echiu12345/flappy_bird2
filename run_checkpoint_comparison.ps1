@@ -1,0 +1,452 @@
+$ErrorActionPreference = "Stop"
+
+$projectDirectory = $PSScriptRoot
+$python = Join-Path $projectDirectory ".venv\Scripts\python.exe"
+$experimentRoot = Join-Path $projectDirectory "state_experiments"
+$queueLog = Join-Path $experimentRoot "checkpoint-comparison.log"
+$trainerPath = Join-Path $projectDirectory "state_q_network.py"
+$budget = [TimeSpan]::FromHours(6)
+$protocolId = "curve-state4-v1-500k-sc50000-eval20"
+$trainerHash = (Get-FileHash -LiteralPath $trainerPath -Algorithm SHA256).Hash
+$queueStart = Get-Date
+$pairDurationEstimates = [System.Collections.Generic.List[double]]::new()
+$stoppedForBudget = $false
+
+Set-Location $projectDirectory
+New-Item -ItemType Directory -Force $experimentRoot | Out-Null
+
+function Write-QueueLog {
+    param([Parameter(Mandatory = $true)][string]$Message)
+
+    $elapsed = (Get-Date) - $script:queueStart
+    $line = "[{0}] [elapsed {1}] {2}" -f (
+        (Get-Date -Format o), $elapsed.ToString("hh\:mm\:ss"), $Message)
+    $line | Tee-Object -FilePath $script:queueLog -Append
+}
+
+function Get-ExpectedRun {
+    param(
+        [Parameter(Mandatory = $true)][string]$Algorithm,
+        [Parameter(Mandatory = $true)][int]$Seed
+    )
+
+    $runName = "curve-$Algorithm-seed$Seed"
+    [PSCustomObject]@{
+        Algorithm = $Algorithm
+        Seed = $Seed
+        RunName = $runName
+        RunDirectory = Join-Path $script:experimentRoot $runName
+        MaxSteps = 500000
+    }
+}
+
+function New-ProtocolRecord {
+    param([Parameter(Mandatory = $true)]$Run)
+
+    [ordered]@{
+        protocol_id = $script:protocolId
+        trainer_sha256 = $script:trainerHash
+        algorithm = $Run.Algorithm
+        seed = $Run.Seed
+        representation = "state4"
+        max_steps = $Run.MaxSteps
+        episodes_limit = 50000
+        hidden_size = 256
+        batch_size = 128
+        memory_size = 50000
+        learning_starts = 10000
+        train_frequency = 4
+        learning_rate = 0.0001
+        gamma = 0.99
+        tau = 0.005
+        epsilon_start = 0.1
+        epsilon_end = 0.01
+        epsilon_decay_steps = 200000
+        step_checkpoint_interval = 50000
+        evaluation_curve_episodes = 20
+        evaluation_seed = 999
+        fps = 0
+    }
+}
+
+function Get-RunStatus {
+    param([Parameter(Mandatory = $true)]$Run)
+
+    if (-not (Test-Path -LiteralPath $Run.RunDirectory)) {
+        return [PSCustomObject]@{
+            TrainingComplete = $false
+            EvaluationComplete = $false
+        }
+    }
+
+    $protocolPath = Join-Path $Run.RunDirectory "protocol.json"
+    $csvPath = Join-Path $Run.RunDirectory "episodes.csv"
+    $evaluationPath = Join-Path $Run.RunDirectory "evaluation_seed999.csv"
+    $evaluationCurvePath = Join-Path $Run.RunDirectory (
+        "evaluation_curve_seed999.csv")
+    $partialInstruction = (
+        "Move or delete the partial directory after preserving any files you need, " +
+        "then run the queue again: {0}" -f $Run.RunDirectory)
+
+    if (-not (Test-Path -LiteralPath $protocolPath)) {
+        throw "Incomplete or unverified curve run '$($Run.RunName)': protocol.json is missing. $partialInstruction"
+    }
+    if (-not (Test-Path -LiteralPath $csvPath)) {
+        $runConfigPath = Join-Path $Run.RunDirectory "run_config.json"
+        $checkpointDirectory = Join-Path $Run.RunDirectory "checkpoints"
+        $hasCheckpointFiles = (
+            (Test-Path -LiteralPath $checkpointDirectory) -and
+            @(Get-ChildItem -LiteralPath $checkpointDirectory -File -ErrorAction SilentlyContinue).Count -gt 0
+        )
+        if (
+            -not (Test-Path -LiteralPath $runConfigPath) -and
+            -not $hasCheckpointFiles
+        ) {
+            # The previous launcher may have stopped after writing only its
+            # protocol file (for example, because PowerShell interpreted an
+            # informational TensorFlow stderr line as an error). No training
+            # state exists, so starting this run from scratch is safe.
+            return [PSCustomObject]@{
+                TrainingComplete = $false
+                EvaluationComplete = $false
+            }
+        }
+        throw "Incomplete curve run '$($Run.RunName)': episodes.csv is missing. $partialInstruction"
+    }
+
+    $protocol = Get-Content -LiteralPath $protocolPath -Raw | ConvertFrom-Json
+    $expectedProtocol = New-ProtocolRecord -Run $Run
+    $protocolMismatch = $false
+    foreach ($name in $expectedProtocol.Keys) {
+        $property = $protocol.PSObject.Properties[$name]
+        if (
+            $null -eq $property -or
+            [string]$property.Value -ne [string]$expectedProtocol[$name]
+        ) {
+            $protocolMismatch = $true
+            break
+        }
+    }
+    if ($protocolMismatch) {
+        throw "Protocol mismatch for '$($Run.RunName)'. Do not resume or mix this run with the final comparison. $partialInstruction"
+    }
+
+    $rows = @(Import-Csv -LiteralPath $csvPath)
+    if ($rows.Count -eq 0) {
+        throw "Incomplete curve run '$($Run.RunName)': episodes.csv has no data rows. $partialInstruction"
+    }
+
+    $previousEpisode = 0L
+    $previousTimestep = 0L
+    foreach ($row in $rows) {
+        $episode = [int64]$row.episode
+        $timestep = [int64]$row.timestep
+        if (
+            $row.algorithm -ne $Run.Algorithm -or
+            $row.representation -ne "state4" -or
+            [int]$row.seed -ne $Run.Seed -or
+            $episode -le $previousEpisode -or
+            $timestep -le $previousTimestep
+        ) {
+            throw "Invalid or mixed data in '$csvPath'. Do not use it for the final comparison. $partialInstruction"
+        }
+        $previousEpisode = $episode
+        $previousTimestep = $timestep
+    }
+
+    $lastRow = $rows[-1]
+    $lastTimestep = [int64]$lastRow.timestep
+    $lastEpisode = [int64]$lastRow.episode
+    if ($lastTimestep -ne $Run.MaxSteps) {
+        throw "Incomplete curve run '$($Run.RunName)': found $lastTimestep of $($Run.MaxSteps) timesteps. Unsafe resume is disabled. $partialInstruction"
+    }
+
+    $checkpointIndex = Join-Path $Run.RunDirectory (
+        "checkpoints\state-$($Run.Algorithm)-$lastEpisode.index")
+    if (-not (Test-Path -LiteralPath $checkpointIndex)) {
+        throw "Checkpoint/CSV mismatch for '$($Run.RunName)': expected '$checkpointIndex'. $partialInstruction"
+    }
+
+    $expectedSteps = @(
+        50000, 100000, 150000, 200000, 250000,
+        300000, 350000, 400000, 450000, 500000)
+    $stepCheckpointDirectory = Join-Path (
+        $Run.RunDirectory) "step_checkpoints"
+    $stepCheckpointIndices = @(
+        foreach ($step in $expectedSteps) {
+            Join-Path $stepCheckpointDirectory (
+                "state-$($Run.Algorithm)-$step.index")
+        }
+    )
+    $missingStepCheckpoints = @(
+        $stepCheckpointIndices | Where-Object {
+            -not (Test-Path -LiteralPath $_)
+        })
+    if ($missingStepCheckpoints.Count -gt 0) {
+        throw (
+            "Incomplete fixed-timestep checkpoints for '$($Run.RunName)': " +
+            ($missingStepCheckpoints -join ", ") + ". " +
+            $partialInstruction)
+    }
+
+    $finalEvaluationComplete = $false
+    if (Test-Path -LiteralPath $evaluationPath) {
+        $evaluationRows = @(Import-Csv -LiteralPath $evaluationPath)
+        $invalidEvaluation = (
+            $evaluationRows.Count -ne 50 -or
+            @($evaluationRows | Where-Object {
+                $_.algorithm -ne $Run.Algorithm -or
+                $_.run_name -ne $Run.RunName -or
+                [int]$_.evaluation_seed -ne 999
+            }).Count -gt 0 -or
+            (Get-Item -LiteralPath $evaluationPath).LastWriteTimeUtc -lt
+                (Get-Item -LiteralPath $checkpointIndex).LastWriteTimeUtc
+        )
+        if ($invalidEvaluation) {
+            throw "Invalid or stale evaluation for '$($Run.RunName)'. Remove only '$evaluationPath' and run the queue again."
+        }
+        $finalEvaluationComplete = $true
+    }
+
+    $curveEvaluationComplete = $false
+    if (Test-Path -LiteralPath $evaluationCurvePath) {
+        $curveRows = @(Import-Csv -LiteralPath $evaluationCurvePath)
+        $invalidCurve = (
+            $curveRows.Count -ne 200 -or
+            @($curveRows | Where-Object {
+                $_.algorithm -ne $Run.Algorithm -or
+                $_.run_name -ne $Run.RunName -or
+                [int]$_.evaluation_seed -ne 999
+            }).Count -gt 0)
+        foreach ($step in $expectedSteps) {
+            if (@($curveRows | Where-Object {
+                    [int]$_.training_timestep -eq $step
+                }).Count -ne 20) {
+                $invalidCurve = $true
+            }
+        }
+        if ((Get-Item -LiteralPath $evaluationCurvePath).LastWriteTimeUtc -lt
+                (Get-Item -LiteralPath $stepCheckpointIndices[-1]).LastWriteTimeUtc) {
+            $invalidCurve = $true
+        }
+        if ($invalidCurve) {
+            throw "Invalid or stale checkpoint evaluation curve for '$($Run.RunName)'. Remove only '$evaluationCurvePath' and run the queue again."
+        }
+        $curveEvaluationComplete = $true
+    }
+
+    return [PSCustomObject]@{
+        TrainingComplete = $true
+        EvaluationComplete = (
+            $finalEvaluationComplete -and $curveEvaluationComplete)
+    }
+}
+
+# Build the five paired seeds in advance and validate every existing curve run
+# before starting any new training. A partial run aborts the entire queue.
+$pairs = foreach ($seed in 42..46) {
+    [PSCustomObject]@{
+        Seed = $seed
+        Runs = @(
+            (Get-ExpectedRun -Algorithm "dqn" -Seed $seed),
+            (Get-ExpectedRun -Algorithm "ddqn" -Seed $seed)
+        )
+    }
+}
+
+$statuses = @{}
+foreach ($pair in $pairs) {
+    foreach ($run in $pair.Runs) {
+        $statuses[$run.RunName] = Get-RunStatus -Run $run
+    }
+}
+
+Write-QueueLog "Fresh checkpoint-curve preflight passed for all five DQN/DDQN seed pairs."
+Write-QueueLog "Soft operational budget: 6 hours. A started seed pair will always finish."
+
+foreach ($pair in $pairs) {
+    $elapsed = (Get-Date) - $queueStart
+    $pairRequiresWork = @($pair.Runs | Where-Object {
+        $status = $statuses[$_.RunName]
+        -not $status.TrainingComplete -or -not $status.EvaluationComplete
+    }).Count -gt 0
+    if ($pairRequiresWork -and $pairDurationEstimates.Count -gt 0) {
+        $estimatedPairSeconds = (
+            $pairDurationEstimates | Measure-Object -Average).Average
+        $projectedFinish = $elapsed.TotalSeconds + $estimatedPairSeconds
+        Write-QueueLog (
+            "Before seed {0}: elapsed {1}; estimated next-pair duration {2}." -f
+            $pair.Seed, $elapsed.ToString("hh\:mm\:ss"),
+            ([TimeSpan]::FromSeconds($estimatedPairSeconds)).ToString("hh\:mm\:ss"))
+        if ($projectedFinish -gt $budget.TotalSeconds) {
+            Write-QueueLog (
+                (("Soft 6-hour budget would be exceeded by starting seed {0}; " +
+                "stopping before this pair. Estimates are based on pairs " +
+                "completed during this invocation.") -f $pair.Seed))
+            $stoppedForBudget = $true
+            break
+        }
+    }
+
+    $pairStart = Get-Date
+    $pairDidWork = $false
+    $newTrainingRuns = 0
+    Write-QueueLog "Starting paired seed $($pair.Seed)."
+
+    # No budget check occurs inside this loop: once a seed pair starts, both
+    # algorithms and their evaluations are allowed to finish.
+    foreach ($run in $pair.Runs) {
+        $status = $statuses[$run.RunName]
+        if ($status.TrainingComplete) {
+            Write-QueueLog "Skipping completed and validated training run $($run.RunName)."
+        }
+        else {
+            $pairDidWork = $true
+            $newTrainingRuns += 1
+            New-Item -ItemType Directory -Force $run.RunDirectory | Out-Null
+            $protocolPath = Join-Path $run.RunDirectory "protocol.json"
+            New-ProtocolRecord -Run $run |
+                ConvertTo-Json -Depth 3 |
+                Set-Content -LiteralPath $protocolPath -Encoding UTF8
+
+            Write-QueueLog "Training fresh run $($run.RunName) to $($run.MaxSteps) steps."
+            $previousErrorActionPreference = $ErrorActionPreference
+            $pythonExitCode = $null
+            try {
+                # TensorFlow writes normal startup information to stderr.
+                # Keep it in the combined log, but judge the native process by
+                # its exit code instead of PowerShell's NativeCommandError.
+                $ErrorActionPreference = "Continue"
+                & $python -u state_q_network.py `
+                    --algorithm $run.Algorithm `
+                    --run-name $run.RunName `
+                    --from-scratch `
+                    --seed $run.Seed `
+                    --episodes 50000 `
+                    --max-steps $run.MaxSteps `
+                    --hidden-size 256 `
+                    --batch-size 128 `
+                    --memory-size 50000 `
+                    --learning-starts 10000 `
+                    --train-frequency 4 `
+                    --learning-rate 0.0001 `
+                    --gamma 0.99 `
+                    --tau 0.005 `
+                    --epsilon-start 0.1 `
+                    --epsilon-end 0.01 `
+                    --epsilon-decay-steps 200000 `
+                    --checkpoint-interval 50 `
+                    --step-checkpoint-interval 50000 `
+                    --fps 0 2>&1 |
+                    Tee-Object -FilePath $queueLog -Append
+                $pythonExitCode = $LASTEXITCODE
+            }
+            finally {
+                $ErrorActionPreference = $previousErrorActionPreference
+            }
+
+            if ($pythonExitCode -ne 0) {
+                throw "$($run.RunName) failed with exit code $pythonExitCode. Its directory is now partial and must not be resumed."
+            }
+            $status = Get-RunStatus -Run $run
+            $statuses[$run.RunName] = $status
+        }
+
+        if ($status.EvaluationComplete) {
+            Write-QueueLog "Skipping completed and validated evaluation for $($run.RunName)."
+        }
+        else {
+            $pairDidWork = $true
+            Write-QueueLog "Evaluating $($run.RunName) for 50 greedy episodes."
+            $previousErrorActionPreference = $ErrorActionPreference
+            $pythonExitCode = $null
+            try {
+                $ErrorActionPreference = "Continue"
+                & $python -u state_q_network.py `
+                    --mode eval `
+                    --algorithm $run.Algorithm `
+                    --run-name $run.RunName `
+                    --seed 999 `
+                    --eval-episodes 50 2>&1 |
+                    Tee-Object -FilePath $queueLog -Append
+                $pythonExitCode = $LASTEXITCODE
+            }
+            finally {
+                $ErrorActionPreference = $previousErrorActionPreference
+            }
+
+            if ($pythonExitCode -ne 0) {
+                throw "$($run.RunName) evaluation failed with exit code $pythonExitCode."
+            }
+
+            Write-QueueLog (
+                "Evaluating 10 checkpoints for $($run.RunName), " +
+                "20 fixed-seed greedy episodes each.")
+            $previousErrorActionPreference = $ErrorActionPreference
+            $pythonExitCode = $null
+            try {
+                $ErrorActionPreference = "Continue"
+                & $python -u state_q_network.py `
+                    --mode eval-curve `
+                    --algorithm $run.Algorithm `
+                    --run-name $run.RunName `
+                    --seed 999 `
+                    --max-steps $run.MaxSteps `
+                    --step-checkpoint-interval 50000 `
+                    --eval-episodes 20 2>&1 |
+                    Tee-Object -FilePath $queueLog -Append
+                $pythonExitCode = $LASTEXITCODE
+            }
+            finally {
+                $ErrorActionPreference = $previousErrorActionPreference
+            }
+            if ($pythonExitCode -ne 0) {
+                throw "$($run.RunName) checkpoint evaluation failed with exit code $pythonExitCode."
+            }
+            $status = Get-RunStatus -Run $run
+            $statuses[$run.RunName] = $status
+        }
+    }
+
+    $pairDuration = (Get-Date) - $pairStart
+    Write-QueueLog (
+        "Finished paired seed {0} in {1}." -f
+        $pair.Seed, $pairDuration.ToString("hh\:mm\:ss"))
+    if ($newTrainingRuns -gt 0) {
+        # Scale a half-new pair to a full-pair equivalent when one validated
+        # training run was already present. Evaluation time remains included.
+        $fullPairEquivalent = (
+            $pairDuration.TotalSeconds * 2.0 / $newTrainingRuns)
+        $pairDurationEstimates.Add($fullPairEquivalent)
+        Write-QueueLog (
+            "Timing estimate added for seed {0}: {1} full-pair equivalent." -f
+            $pair.Seed,
+            ([TimeSpan]::FromSeconds($fullPairEquivalent)).ToString("hh\:mm\:ss"))
+    }
+    elseif ($pairDidWork) {
+        Write-QueueLog (
+            (("Seed {0} required evaluation only; its duration is not used to " +
+            "project a full training pair.") -f $pair.Seed))
+    }
+}
+
+$analysisCommand = (
+    ".\.venv\Scripts\python.exe analyze_state_experiments.py " +
+    "--run-prefix curve --seeds 42 43 44 45 46 --max-timestep 500000 " +
+    "--expected-evaluation-episodes 50 " +
+    "--output-dir state_experiments/curve-comparison-500k")
+if ($stoppedForBudget) {
+    $analysisCommand += " --allow-missing"
+    Write-QueueLog "Queue stopped at a seed-pair boundary under the soft 6-hour budget."
+}
+else {
+    Write-QueueLog "All available seed pairs and evaluations are complete."
+}
+Write-QueueLog "Analysis command: $analysisCommand"
+Write-QueueLog (
+    "Greedy curve command: .\.venv\Scripts\python.exe " +
+    "analyze_evaluation_curves.py --run-prefix curve " +
+    "--seeds 42 43 44 45 46 --max-timestep 500000 " +
+    "--checkpoint-interval 50000 --episodes-per-checkpoint 20 " +
+    "--output-dir state_experiments/curve-comparison-500k")
+Write-QueueLog "Total queue elapsed time: $(((Get-Date) - $queueStart).ToString('hh\:mm\:ss'))."

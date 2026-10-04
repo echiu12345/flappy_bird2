@@ -86,10 +86,22 @@ Both algorithms use the same `4 -> 256 -> 256 -> 2` MLP, replay memory, Huber
 loss, exploration schedule, and soft target updates. The only algorithmic
 difference is the DQN versus Double DQN bootstrap target.
 
+The final comparison protocol uses a 10,000-step replay warm-up, a
+timestep-based epsilon schedule, and one gradient update every four environment
+steps. Both algorithms therefore receive the same exploration rate and update
+budget at the same interaction count. See `EXPERIMENT_PLAN.md` for the
+controlled multi-seed design and metric definitions.
+
+For a quick manual run, use:
+
 ```powershell
 .\.venv\Scripts\python.exe state_q_network.py --algorithm dqn --run-name state-dqn-seed42 --from-scratch --seed 42
 .\.venv\Scripts\python.exe state_q_network.py --algorithm ddqn --run-name state-ddqn-seed42 --from-scratch --seed 42
 ```
+
+These manual commands use the default episode limit and are not the final
+fixed-budget comparison. Use the overnight queue below to create the controlled
+`fair-` datasets.
 
 Generate the comparison graph with the same plotting tool:
 
@@ -101,6 +113,52 @@ Generate the comparison graph with the same plotting tool:
 when one run continued training beyond 500,000 steps. The score panel marks the
 highest rolling mean in the selected range.
 
+#### Overnight local comparison queue
+
+Run the verified PowerShell queue from the project directory to execute the
+experiments sequentially on the same machine:
+
+```powershell
+.\run_overnight_comparison.ps1
+```
+
+The queue is designed to train five paired DQN/DDQN runs (seeds 42 through 46),
+each for a fixed 500,000-step budget. These final-comparison runs use `fair-`
+run names and a shared timestep-based epsilon schedule, so they do not mix with
+earlier pilot runs that decayed epsilon by episode. It uses one process at a
+time to avoid CPU contention and invokes Python in unbuffered mode so progress
+appears promptly in `state_experiments/overnight-comparison.log`.
+
+Every new `fair-` run starts from random weights. The queue records its fixed
+parameters and training-script hash in `protocol.json`; the trainer separately
+records the scientific hyperparameters in `run_config.json`. A completed run
+with a matching protocol, a complete 500,000-step CSV, and the matching final
+checkpoint may be skipped. An incomplete or inconsistent `fair-` directory
+causes the queue to stop with a cleanup instruction. It is deliberately not
+resumed because replay memory and random-number-generator state are not stored
+in checkpoints; mixing an interrupted continuation into the final comparison
+would weaken the result.
+
+The queue applies a **soft six-hour operational budget**. After completing a
+seed pair, it uses elapsed time and the durations of pairs completed during the
+current invocation to estimate whether another whole pair fits. It does not
+start that pair when the estimate exceeds six hours. Once a pair starts, both
+algorithms and their 50-episode greedy evaluations are allowed to finish, so
+the total runtime can exceed six hours. The first pair also has no prior timing
+estimate. This is a scheduling guard, not a guaranteed deadline.
+
+After the queue completes, generate the multi-seed report:
+
+```powershell
+.\.venv\Scripts\python.exe analyze_state_experiments.py --run-prefix fair --seeds 42 43 44 45 46 --max-timestep 500000 --output-dir state_experiments/fair-comparison-500k
+```
+
+The queue prints and logs this analysis command together with total elapsed
+time. If it stops at a pair boundary under the soft budget, the logged command
+adds `--allow-missing` to produce an interim report from the completed pairs.
+Run the queue again on another uninterrupted session to collect the remaining
+pairs; already completed and validated runs will be skipped.
+
 Evaluate saved policies without exploration or learning, using a different
 seed from training:
 
@@ -108,6 +166,29 @@ seed from training:
 .\.venv\Scripts\python.exe state_q_network.py --mode eval --algorithm dqn --run-name state-dqn-seed42 --seed 1042 --eval-episodes 100
 .\.venv\Scripts\python.exe state_q_network.py --mode eval --algorithm ddqn --run-name state-ddqn-seed42 --seed 1042 --eval-episodes 100
 ```
+
+#### Fixed-checkpoint greedy evaluation curves
+
+The final learning-dynamics experiment uses new `curve-` run names so the
+existing `fair-` results remain unchanged. It saves permanent checkpoints at
+50,000-step intervals from 50,000 through 500,000 steps. Every checkpoint is
+then evaluated with `epsilon = 0` on the same 20 episode seeds (999 through
+1018). Training hyperparameters are otherwise identical to the fair runs.
+
+```powershell
+.\run_checkpoint_comparison.ps1
+```
+
+After all five paired seeds finish, generate the greedy evaluation curve:
+
+```powershell
+.\.venv\Scripts\python.exe analyze_evaluation_curves.py --run-prefix curve --seeds 42 43 44 45 46 --max-timestep 500000 --checkpoint-interval 50000 --episodes-per-checkpoint 20 --output-dir state_experiments/curve-comparison-500k
+```
+
+The output `greedy_evaluation_curves.png` shows each training seed faintly and
+the DQN/Double DQN cross-seed mean with ±1 sample standard deviation. These
+curves measure policy performance during learning and should be distinguished
+from the epsilon-greedy training-score curves.
 
 #### Run state DDQN on Google Colab
 
